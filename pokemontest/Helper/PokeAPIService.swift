@@ -9,6 +9,7 @@
 // MARK: Data/Service (PokeAPI)
 // =============================================================
 import Foundation
+import CoreData
 
 // MARK: Paging model & list service
 struct PokemonPage {
@@ -66,6 +67,7 @@ final class PokeAPIService: PokemonService, PokemonDetailRepository {
 
     // MARK: - PokemonService (list)
     func fetchPokemonPage(limit: Int, offset: Int) async throws -> PokemonPage {
+    do {
         let dto: PokemonListResponse = try await get(
             "pokemon",
             queryItems: [
@@ -83,8 +85,19 @@ final class PokeAPIService: PokemonService, PokemonDetailRepository {
                 .first(where: { $0.name == "offset" })?
                 .value.flatMap(Int.init)
         }
+        
+        saveToCoreData(items)    // <-- simpan cache di background
         return PokemonPage(items: items, nextOffset: nextOffset)
+    } catch {
+            // fallback ke cache
+            let cached = await loadCachedPage(limit: limit, offset: offset)
+            if !cached.isEmpty {
+                return PokemonPage(items: cached, nextOffset: offset + cached.count)
+            }
+            throw error
+        }
     }
+
 
     // MARK: - PokemonDetailRepository (detail)
     func fetchDetail(id: Int) async throws -> DetailPokemon {
@@ -98,5 +111,42 @@ struct FetchPokemonDetail {
     let repo: PokemonDetailRepository
     func callAsFunction(_ id: Int) async throws -> DetailPokemon {
         try await repo.fetchDetail(id: id)
+    }
+}
+
+
+
+
+fileprivate extension PokeAPIService {
+    func saveToCoreData(_ items: [Pokemon]) {
+        Task.detached {
+            let ctx = CoreDataStack.shared.newBackgroundContext()
+            ctx.mergePolicy = NSMergeByPropertyObjectTrumpMergePolicy
+            do {
+                try await ctx.perform {
+                    for p in items {
+                        let req: NSFetchRequest<PokemonEntity> = PokemonEntity.fetchRequest()
+                        req.fetchLimit = 1
+                        req.predicate = NSPredicate(format: "id == %d", p.id)
+                        let entity = (try? ctx.fetch(req).first) ?? PokemonEntity(context: ctx)
+                        entity.apply(from: p)
+                    }
+                    if ctx.hasChanges { try ctx.save() }
+                }
+            } catch {
+                print("CoreData save error:", error)
+            }
+        }
+    }
+
+    func loadCachedPage(limit: Int, offset: Int) async -> [Pokemon] {
+        let ctx = CoreDataStack.shared.viewContext
+        return await ctx.perform {
+            let req: NSFetchRequest<PokemonEntity> = PokemonEntity.fetchRequest()
+            req.sortDescriptors = [NSSortDescriptor(key: "id", ascending: true)]
+            req.fetchLimit = limit
+            req.fetchOffset = offset
+            return (try? ctx.fetch(req))?.map { $0.toDomain() } ?? []
+        }
     }
 }
